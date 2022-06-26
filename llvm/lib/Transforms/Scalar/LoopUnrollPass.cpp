@@ -28,11 +28,17 @@
 #include "llvm/Analysis/LoopAnalysisManager.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/LoopPass.h"
+#include "llvm/Analysis/LoopPropertiesAnalysis.h"
 #include "llvm/Analysis/LoopUnrollAnalyzer.h"
+#include "llvm/Analysis/MLModelRunner.h"
+#include "llvm/Analysis/NoInferenceModelRunner.h"
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
 #include "llvm/Analysis/ProfileSummaryInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/Analysis/TensorSpec.h"
+#include "llvm/Analysis/Utils/TrainingLogger.h"
+#include "llvm/Analysis/Utils/TFUtils.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constant.h"
@@ -43,6 +49,7 @@
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/InitializePasses.h"
@@ -65,6 +72,7 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <system_error>
 #include <tuple>
 #include <utility>
 
@@ -270,6 +278,127 @@ TargetTransformInfo::UnrollingPreferences llvm::gatherUnrollingPreferences(
 
   return UP;
 }
+
+/***** Start of MLGO *****/
+namespace mlgo_loop_unroll {
+// FIXME: Interface this to an option later
+static const std::string TrainingLog = "mlgo_unroll_training.log";
+
+// Tuple of (data_type, variable_name, shape, description)
+#define LOOP_UNROLL_FEATURES_LIST(M)                                           \
+  M(int64_t, is_innermost_loop, {1}, "1: Is innermost loop, 0: otherwise")     \
+  M(int64_t, bb_count, {1}, "How much basic block the loop contains")
+
+enum FeatureIDs {
+#define _FEATURE_IDX(_, name, __, ___) name,
+  LOOP_UNROLL_FEATURES_LIST(_FEATURE_IDX)
+#undef _FEATURE_IDX
+      FeatureCount
+};
+
+#define _DECL_FEATURES(type, name, shape, _)                                   \
+  TensorSpec::createSpec<type>(#name, shape),
+
+// We can have separate kinds InputFeatures for training / production mode. For
+// now lets have one only for training.
+static const std::vector<TensorSpec> MLGOUnrollInputFeatures{
+    {LOOP_UNROLL_FEATURES_LIST(_DECL_FEATURES)},
+};
+#undef _DECL_FEATURES
+
+static const TensorSpec MLGOUnrollOutputFeature =
+    TensorSpec::createSpec<int32_t>("unroll_count", {1});
+
+// Dummy reward
+static const TensorSpec MLGOUnrollRewardFeature =
+    TensorSpec::createSpec<float>("reward", {1});
+
+class MLGOLoopUnrollAnalysis {
+  // Lets do development mode first
+  std::unique_ptr<NoInferenceModelRunner> Runner;
+  // Loop::getName() -> Logger
+  StringMap<std::unique_ptr<Logger>> LogMap;
+
+public:
+  MLGOLoopUnrollAnalysis(LLVMContext &Ctx) {
+    Runner =
+        std::make_unique<NoInferenceModelRunner>(Ctx, MLGOUnrollInputFeatures);
+  }
+
+  // Log data into runner
+  void extractFeatures(Loop *L, LoopInfo *LI, ScalarEvolution *SE,
+                       TargetTransformInfo::UnrollingPreferences &UP);
+
+  // Save **ALL** the logs
+  bool flush(LLVMContext &Ctx);
+
+private:
+  template <typename T> size_t getTotalSize(const std::vector<int64_t> &Shape) {
+    size_t Ret = sizeof(T);
+    for (const auto V : Shape)
+      Ret *= V;
+    return Ret;
+  }
+
+  void resetInputs() {
+#define _RESET(type, name, shape, _)                                           \
+  std::memset(Runner->getTensorUntyped(FeatureIDs::name), 0,                   \
+              getTotalSize<type>(shape));
+    LOOP_UNROLL_FEATURES_LIST(_RESET)
+#undef _RESET
+  }
+};
+
+void MLGOLoopUnrollAnalysis::extractFeatures(
+    Loop *L, LoopInfo *LI, ScalarEvolution *SE,
+    TargetTransformInfo::UnrollingPreferences &UP) {
+  // Reset the Runner
+  resetInputs();
+  LoopPropertiesInfo LPI = LoopPropertiesInfo::getLoopPropertiesInfo(L, LI, SE);
+
+#define SET(id, type, val)                                                     \
+  do {                                                                         \
+    *Runner->getTensor<type>(FeatureIDs::id) = static_cast<type>(val);         \
+  } while (false);
+  SET(is_innermost_loop, int64_t, LPI.IsInnerMostLoop);
+  SET(bb_count, int64_t, LPI.BasicBlockCount);
+#undef SET
+
+  assert(!LogMap.count(L->getName()) &&
+         "Should only extract feature for every Loop ONCE");
+  std::vector<LoggedFeatureSpec> LFS;
+  for (const auto &IF : MLGOUnrollInputFeatures) {
+    LFS.push_back({IF, None});
+  }
+  LFS.push_back({MLGOUnrollOutputFeature, None});
+
+  auto I = LogMap.insert((std::make_pair(
+      L->getName(), std::make_unique<Logger>(LFS, MLGOUnrollRewardFeature,
+                                             /* IncludeReward */ false))));
+  assert(I.second && "Should be unique insertion");
+
+  Logger *Log = I.first->second.get();
+  size_t CurrentFeature = 0;
+  for (; CurrentFeature < FeatureIDs::FeatureCount; ++CurrentFeature) {
+    Log->logSpecifiedTensorValue(CurrentFeature,
+                                 reinterpret_cast<const char *>(
+                                     Runner->getTensorUntyped(CurrentFeature)));
+  }
+  Log->logInt32Value(CurrentFeature, reinterpret_cast<int32_t *>(&UP.Count));
+}
+
+bool MLGOLoopUnrollAnalysis::flush(LLVMContext &Ctx) {
+  std::error_code EC;
+  auto OS = std::make_unique<raw_fd_stream>(TrainingLog, EC);
+  if (EC) {
+    Ctx.emitError(EC.message() + ":" + TrainingLog);
+    return false;
+  }
+  Logger::flushLogs(*OS, LogMap);
+  return true;
+}
+/***** End of MLGO *****/
+} // namespace mlgo_loop_unroll
 
 namespace {
 
