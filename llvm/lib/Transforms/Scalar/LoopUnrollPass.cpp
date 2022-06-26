@@ -280,6 +280,9 @@ TargetTransformInfo::UnrollingPreferences llvm::gatherUnrollingPreferences(
 }
 
 /***** Start of MLGO *****/
+static cl::opt<bool>
+    EnableMLGOUnroll("mlgo-unroll", cl::init(false), cl::Hidden,
+                     cl::desc("Allows MLGO to operate on LoopUnroll"));
 namespace mlgo_loop_unroll {
 // FIXME: Interface this to an option later
 static const std::string TrainingLog = "mlgo_unroll_training.log";
@@ -1532,16 +1535,20 @@ public:
         ProvidedAllowProfileBasedPeeling(AllowProfileBasedPeeling),
         ProvidedFullUnrollMaxCount(ProvidedFullUnrollMaxCount) {
 /***** Start of MLGO *****/
-    ScalarEvolution &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
-    MLGO = new mlgo_loop_unroll::MLGOLoopUnrollAnalysis(SE.getContext());
+    if (EnableMLGOUnroll) { // MLGO
+      ScalarEvolution &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
+      MLGO = new mlgo_loop_unroll::MLGOLoopUnrollAnalysis(SE.getContext());
+    }
 /***** End of MLGO *****/
     initializeLoopUnrollPass(*PassRegistry::getPassRegistry());
   }
 
 /***** Start of MLGO *****/
   bool doFinalization() override {
-    ScalarEvolution &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
-    MLGO->flush(SE.getContext());
+    if (EnableMLGOUnroll) {
+      ScalarEvolution &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
+      MLGO->flush(SE.getContext());
+    }
     return false;
   }
 /***** End of MLGO *****/
