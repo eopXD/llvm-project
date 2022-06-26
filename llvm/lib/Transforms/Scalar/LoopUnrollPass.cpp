@@ -400,6 +400,8 @@ bool MLGOLoopUnrollAnalysis::flush(LLVMContext &Ctx) {
 /***** End of MLGO *****/
 } // namespace mlgo_loop_unroll
 
+static mlgo_loop_unroll::MLGOLoopUnrollAnalysis *LocalMLGO = nullptr;
+
 namespace {
 
 /// A struct to densely store the state of an instruction after unrolling at
@@ -1435,6 +1437,12 @@ static LoopUnrollResult tryToUnrollLoop(
   // computeUnrollCount().
   UP.Runtime &= TripCount == 0 && TripMultiple % UP.Count != 0;
 
+/***** Start of MLGO *****/
+  if (LocalMLGO) {
+    LocalMLGO->extractFeatures(L, LI, &SE, UP);
+  }
+/***** End of MLGO *****/
+
   // Save loop properties before it is transformed.
   MDNode *OrigLoopID = L->getLoopID();
 
@@ -1504,6 +1512,10 @@ public:
   Optional<bool> ProvidedAllowProfileBasedPeeling;
   Optional<unsigned> ProvidedFullUnrollMaxCount;
 
+/***** Start of MLGO *****/
+  mlgo_loop_unroll::MLGOLoopUnrollAnalysis *MLGO = nullptr;
+/***** End of MLGO *****/
+
   LoopUnroll(int OptLevel = 2, bool OnlyWhenForced = false,
              bool ForgetAllSCEV = false, Optional<unsigned> Threshold = None,
              Optional<unsigned> Count = None,
@@ -1519,8 +1531,20 @@ public:
         ProvidedAllowPeeling(AllowPeeling),
         ProvidedAllowProfileBasedPeeling(AllowProfileBasedPeeling),
         ProvidedFullUnrollMaxCount(ProvidedFullUnrollMaxCount) {
+/***** Start of MLGO *****/
+    ScalarEvolution &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
+    MLGO = new mlgo_loop_unroll::MLGOLoopUnrollAnalysis(SE.getContext());
+/***** End of MLGO *****/
     initializeLoopUnrollPass(*PassRegistry::getPassRegistry());
   }
+
+/***** Start of MLGO *****/
+  bool doFinalization() override {
+    ScalarEvolution &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
+    MLGO->flush(SE.getContext());
+    return false;
+  }
+/***** End of MLGO *****/
 
   bool runOnLoop(Loop *L, LPPassManager &LPM) override {
     if (skipLoop(L))
@@ -1540,12 +1564,22 @@ public:
     OptimizationRemarkEmitter ORE(&F);
     bool PreserveLCSSA = mustPreserveAnalysisID(LCSSAID);
 
+/***** Start of MLGO *****/
+    // Only allow MLGO to when this current runOnLoop is called
+    LocalMLGO = MLGO;
+/***** End of MLGO *****/
+
     LoopUnrollResult Result = tryToUnrollLoop(
         L, DT, LI, SE, TTI, AC, ORE, nullptr, nullptr, PreserveLCSSA, OptLevel,
         OnlyWhenForced, ForgetAllSCEV, ProvidedCount, ProvidedThreshold,
         ProvidedAllowPartial, ProvidedRuntime, ProvidedUpperBound,
         ProvidedAllowPeeling, ProvidedAllowProfileBasedPeeling,
         ProvidedFullUnrollMaxCount);
+
+/***** Start of MLGO *****/
+    // Erase the pointer back to null in case other users of tryToUnrollLoop uses MLGO
+    LocalMLGO = nullptr;
+/***** End of MLGO *****/
 
     if (Result == LoopUnrollResult::FullyUnrolled)
       LPM.markLoopAsDeleted(*L);
