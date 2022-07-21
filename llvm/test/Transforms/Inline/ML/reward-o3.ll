@@ -1,6 +1,6 @@
-; RUN: llc -calc-inl-reward --filetype=asm < %s | FileCheck -check-prefix=EXPR %s
+; RUN: llc -calc-reward --filetype=asm < %s | FileCheck -check-prefix=EXPR %s
 
-; RUN: llc -calc-inl-reward --filetype=obj -o %t.o %s
+; RUN: llc -calc-reward --filetype=obj -o %t.o %s
 ; RUN: llvm-objcopy --dump-section=.llvm_block_data.=%t.data %t.o /dev/null
 ; RUN: llvm-objdump -d %t.o | FileCheck -check-prefix=DUMP %s
 ; RUN: %python %p/Inputs/parse_reward.py %t.data | FileCheck -check-prefix=OBJ %s

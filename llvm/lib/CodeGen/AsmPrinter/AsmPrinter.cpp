@@ -128,7 +128,8 @@ using namespace llvm;
 
 #define DEBUG_TYPE "asm-printer"
 
-static cl::opt<bool> CalculateInlReward("calc-inl-reward", cl::init(false));
+// Calculating reward (iCache pressure & Latency) for reinforment learning
+static cl::opt<bool> CalculateReward("calc-reward", cl::init(false));
 
 const char DWARFGroupName[] = "dwarf";
 const char DWARFGroupDescription[] = "DWARF Emission";
@@ -1690,11 +1691,11 @@ void AsmPrinter::emitFunctionBody() {
     // We must emit temporary symbol for the end of this basic block, if either
     // we have BBLabels enabled or if this basic blocks marks the end of a
     // section.
-    if (CalculateInlReward || MF->hasBBLabels() ||
+    if (CalculateReward || MF->hasBBLabels() ||
         (MAI->hasDotTypeDotSizeDirective() && MBB.isEndSection()))
       OutStreamer->emitLabel(MBB.getEndSymbol());
 
-    if (CalculateInlReward) {
+    if (CalculateReward) {
       const MCExpr *Size = MCBinaryExpr::createSub(
           MCSymbolRefExpr::create(MBB.getEndSymbol(), OutContext),
           MCSymbolRefExpr::create(MBB.getSymbol(), OutContext), OutContext);
@@ -2323,7 +2324,7 @@ bool AsmPrinter::doFinalization(Module &M) {
   MMI = nullptr;
   AddrLabelSymbols = nullptr;
 
-  if (CalculateInlReward) {
+  if (CalculateReward) {
     // We output a succession of: function name, followed by a comma, followed
     // by the reward, followed by a comma, and then the next function, etc.
     auto *DS = OutStreamer->getContext().getELFNamedSection(
@@ -3898,9 +3899,9 @@ void AsmPrinter::emitVisibility(MCSymbol *Sym, unsigned Visibility,
 
 bool AsmPrinter::shouldEmitLabelForBasicBlock(
     const MachineBasicBlock &MBB) const {
-  // If we calculate the inlining reward, we want labels for each basic block,
+  // If we calculate the reward, we want labels for each basic block,
   // so we may evaluate the basic blocks' size.
-  if (CalculateInlReward)
+  if (CalculateReward)
     return true;
   // With `-fbasic-block-sections=`, a label is needed for every non-entry block
   // in the labels mode (option `=labels`) and every section beginning in the
