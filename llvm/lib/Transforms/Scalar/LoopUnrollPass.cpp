@@ -317,13 +317,14 @@ static const TensorSpec MLGOUnrollRewardFeature =
     TensorSpec::createSpec<float>("reward", {1});
 
 class MLGOLoopUnrollAnalysis {
+  LLVMContext &Ctx;
   // Lets do development mode first
   std::unique_ptr<NoInferenceModelRunner> Runner;
   // Loop::getName() -> Logger
   StringMap<std::unique_ptr<Logger>> LogMap;
 
 public:
-  MLGOLoopUnrollAnalysis(LLVMContext &Ctx) {
+  MLGOLoopUnrollAnalysis(LLVMContext &Ctx) : Ctx(Ctx) {
     Runner =
         std::make_unique<NoInferenceModelRunner>(Ctx, MLGOUnrollInputFeatures);
   }
@@ -333,7 +334,7 @@ public:
                        TargetTransformInfo::UnrollingPreferences &UP);
 
   // Save **ALL** the logs
-  bool flush(LLVMContext &Ctx);
+  bool flush();
 
 private:
   template <typename T> size_t getTotalSize(const std::vector<int64_t> &Shape) {
@@ -367,7 +368,11 @@ void MLGOLoopUnrollAnalysis::extractFeatures(
   SET(bb_count, int64_t, LPI.BasicBlockCount);
 #undef SET
 
-  assert(!LogMap.count(L->getName()) &&
+  // Key = $(FUNCTION_NAME)__$(LOOP_NAME)
+  std::string Key =
+      L->getHeader()->getParent()->getName().str() + "__" + L->getName().str();
+  LLVM_DEBUG(dbgs() << "Logging for " << Key << "\n");
+  assert(!LogMap.count(Key) &&
          "Should only extract feature for every Loop ONCE");
   std::vector<LoggedFeatureSpec> LFS;
   for (const auto &IF : MLGOUnrollInputFeatures) {
@@ -376,8 +381,8 @@ void MLGOLoopUnrollAnalysis::extractFeatures(
   LFS.push_back({MLGOUnrollOutputFeature, None});
 
   auto I = LogMap.insert((std::make_pair(
-      L->getName(), std::make_unique<Logger>(LFS, MLGOUnrollRewardFeature,
-                                             /* IncludeReward */ false))));
+      Key, std::make_unique<Logger>(LFS, MLGOUnrollRewardFeature,
+                                    /* IncludeReward */ false))));
   assert(I.second && "Should be unique insertion");
 
   Logger *Log = I.first->second.get();
@@ -390,7 +395,7 @@ void MLGOLoopUnrollAnalysis::extractFeatures(
   Log->logInt32Value(CurrentFeature, reinterpret_cast<int32_t *>(&UP.Count));
 }
 
-bool MLGOLoopUnrollAnalysis::flush(LLVMContext &Ctx) {
+bool MLGOLoopUnrollAnalysis::flush() {
   std::error_code EC;
   auto OS = std::make_unique<raw_fd_stream>(TrainingLog, EC);
   if (EC) {
@@ -1515,10 +1520,6 @@ public:
   Optional<bool> ProvidedAllowProfileBasedPeeling;
   Optional<unsigned> ProvidedFullUnrollMaxCount;
 
-/***** Start of MLGO *****/
-  mlgo_loop_unroll::MLGOLoopUnrollAnalysis *MLGO = nullptr;
-/***** End of MLGO *****/
-
   LoopUnroll(int OptLevel = 2, bool OnlyWhenForced = false,
              bool ForgetAllSCEV = false, Optional<unsigned> Threshold = None,
              Optional<unsigned> Count = None,
@@ -1534,24 +1535,8 @@ public:
         ProvidedAllowPeeling(AllowPeeling),
         ProvidedAllowProfileBasedPeeling(AllowProfileBasedPeeling),
         ProvidedFullUnrollMaxCount(ProvidedFullUnrollMaxCount) {
-/***** Start of MLGO *****/
-    if (EnableMLGOUnroll) { // MLGO
-      ScalarEvolution &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
-      MLGO = new mlgo_loop_unroll::MLGOLoopUnrollAnalysis(SE.getContext());
-    }
-/***** End of MLGO *****/
     initializeLoopUnrollPass(*PassRegistry::getPassRegistry());
   }
-
-/***** Start of MLGO *****/
-  bool doFinalization() override {
-    if (EnableMLGOUnroll) {
-      ScalarEvolution &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
-      MLGO->flush(SE.getContext());
-    }
-    return false;
-  }
-/***** End of MLGO *****/
 
   bool runOnLoop(Loop *L, LPPassManager &LPM) override {
     if (skipLoop(L))
@@ -1571,22 +1556,12 @@ public:
     OptimizationRemarkEmitter ORE(&F);
     bool PreserveLCSSA = mustPreserveAnalysisID(LCSSAID);
 
-/***** Start of MLGO *****/
-    // Only allow MLGO to when this current runOnLoop is called
-    LocalMLGO = MLGO;
-/***** End of MLGO *****/
-
     LoopUnrollResult Result = tryToUnrollLoop(
         L, DT, LI, SE, TTI, AC, ORE, nullptr, nullptr, PreserveLCSSA, OptLevel,
         OnlyWhenForced, ForgetAllSCEV, ProvidedCount, ProvidedThreshold,
         ProvidedAllowPartial, ProvidedRuntime, ProvidedUpperBound,
         ProvidedAllowPeeling, ProvidedAllowProfileBasedPeeling,
         ProvidedFullUnrollMaxCount);
-
-/***** Start of MLGO *****/
-    // Erase the pointer back to null in case other users of tryToUnrollLoop uses MLGO
-    LocalMLGO = nullptr;
-/***** End of MLGO *****/
 
     if (Result == LoopUnrollResult::FullyUnrolled)
       LPM.markLoopAsDeleted(*L);
@@ -1746,6 +1721,12 @@ PreservedAnalyses LoopUnrollPass::run(Function &F,
   auto *BFI = (PSI && PSI->hasProfileSummary()) ?
       &AM.getResult<BlockFrequencyAnalysis>(F) : nullptr;
 
+  /***** Start of MLGO *****/
+  if (EnableMLGOUnroll && !LocalMLGO) {
+    LocalMLGO = new mlgo_loop_unroll::MLGOLoopUnrollAnalysis(SE.getContext());
+  }
+  /***** End of MLGO *****/
+
   bool Changed = false;
 
   // The unroller requires loops to be in simplified form, and also needs LCSSA.
@@ -1830,3 +1811,11 @@ void LoopUnrollPass::printPipeline(
   OS << "O" << UnrollOpts.OptLevel;
   OS << ">";
 }
+
+/***** Start of MLGO *****/
+LoopUnrollPass::~LoopUnrollPass() {
+  if (EnableMLGOUnroll && LocalMLGO) {
+    LocalMLGO->flush();
+  }
+}
+/***** End of MLGO *****/
