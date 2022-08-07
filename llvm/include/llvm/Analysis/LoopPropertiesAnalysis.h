@@ -43,10 +43,6 @@ public:
   bool HasLoopPreheader = false;
   uint64_t PreheaderBlocksize = 0;
 
-  /// Loop Constant Stride (if countable)
-  bool IsLoopStrideCountable = false;
-  APInt LoopStride;
-
   /// Is Countable Loop
   bool IsCountableLoop = false;
 

@@ -20,7 +20,7 @@
 using namespace llvm;
 namespace {
 
-static std::unique_ptr<Module> makeLLVMModule(LLVMContext &Context,
+static std::unique_ptr<Module> makeLLVMModule(LLVMContextj25 &Context,
                                               const char *ModuleStr) {
   SMDiagnostic Err;
   return parseAssemblyString(ModuleStr, Err, Context);
@@ -90,8 +90,6 @@ for.inc:                                          ; preds = %for.body4, %if.end
             EXPECT_EQ(LPI.LoopDepth, 1);
             EXPECT_TRUE(LPI.HasLoopPreheader);
             EXPECT_EQ(LPI.PreheaderBlocksize, 1);
-            EXPECT_TRUE(LPI.IsLoopStrideCountable);
-            EXPECT_EQ(LPI.LoopStride, 1);
             EXPECT_TRUE(LPI.IsCountableLoop);
             EXPECT_TRUE(LPI.IsLoopBackEdgeConstant);
             EXPECT_EQ(LPI.LoopBackEdgeCount, 2);
@@ -115,8 +113,6 @@ for.inc:                                          ; preds = %for.body4, %if.end
             EXPECT_EQ(LPI.LoopDepth, 2);
             EXPECT_TRUE(LPI.HasLoopPreheader);
             EXPECT_EQ(LPI.PreheaderBlocksize, 2);
-            EXPECT_TRUE(LPI.IsLoopStrideCountable);
-            EXPECT_EQ(LPI.LoopStride, 1);
             EXPECT_TRUE(LPI.IsCountableLoop);
             EXPECT_TRUE(LPI.IsLoopBackEdgeConstant);
             EXPECT_EQ(LPI.LoopBackEdgeCount, 6);

@@ -34,17 +34,6 @@ LoopPropertiesInfo::getLoopPropertiesInfo(Loop *L, LoopInfo *LI,
     LPI.PreheaderBlocksize = Preheader->size();
   }
 
-  if (PHINode *IndVar = L->getInductionVariable(*SE)) {
-    if (Optional<Loop::LoopBounds> LB =
-            Loop::LoopBounds::getBounds(*L, *IndVar, *SE)) {
-      if (ConstantInt *StepValueConst =
-              dyn_cast<ConstantInt>(LB->getStepValue())) {
-        LPI.IsLoopStrideCountable = true;
-        LPI.LoopStride = StepValueConst->getValue();
-      }
-    }
-  }
-
   if (SE->hasLoopInvariantBackedgeTakenCount(L)) {
     LPI.IsCountableLoop = true;
     const SCEV *BECount = SE->getBackedgeTakenCount(L);
@@ -90,8 +79,6 @@ void LoopPropertiesInfo::print(raw_ostream &OS) const {
      << "LoopDepth: " << LoopDepth << "\n"
      << "HasLoopPreheader: " << HasLoopPreheader << "\n"
      << "PreheaderBlocksize: " << PreheaderBlocksize << "\n"
-     << "IsLoopStrideCountable: " << IsLoopStrideCountable << "\n"
-     << "LoopStride: " << LoopStride << "\n"
      << "IsCountableLoop: " << IsCountableLoop << "\n"
      << "IsLoopBackEdgeConstant: " << IsLoopBackEdgeConstant << "\n"
      << "LoopBackEdgeCount: " << LoopBackEdgeCount << "\n"
