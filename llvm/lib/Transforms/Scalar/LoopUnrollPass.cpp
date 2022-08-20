@@ -296,19 +296,16 @@ static cl::opt<std::string> TrainingLog(
 enum class MLGOUnrollAdvisorMode : int {
   NotSet = -1,
   Release = 0,  // TODO
-  Training = 1, // ModelUnderTrainingRunner
-  Logging = 2,  // NoInferenceRunner
+  Training = 1, // ModelUnderTrainingRunner, NoInferenceRunner
 };
 
 static cl::opt<MLGOUnrollAdvisorMode> MLGOUnrollMode(
     "mlgo-unroll-mode", cl::Hidden, cl::init(MLGOUnrollAdvisorMode::NotSet),
-    cl::desc("Requires to set to one of 'release', 'development' or 'logging'"),
+    cl::desc("Requires to set to one of 'release' or 'training'"),
     cl::values(clEnumValN(MLGOUnrollAdvisorMode::Release, "release",
                           "precompiled model"),
-               clEnumValN(MLGOUnrollAdvisorMode::Training, "development",
-                          "train rl model"),
-               clEnumValN(MLGOUnrollAdvisorMode::Logging, "logging",
-                          "log feature")));
+               clEnumValN(MLGOUnrollAdvisorMode::Training, "training",
+                          "train rl model")));
 
 namespace mlgo_loop_unroll {
 
@@ -371,12 +368,17 @@ class MLGOLoopUnrollAnalysis {
 
 public:
   MLGOLoopUnrollAnalysis(LLVMContext &Ctx) : Ctx(Ctx) {
-    if (MLGOUnrollMode == MLGOUnrollAdvisorMode::Logging)
-      Runner = std::make_unique<NoInferenceModelRunner>(
-          Ctx, MLGOUnrollInputFeatures);
-    else if (MLGOUnrollMode == MLGOUnrollAdvisorMode::Training)
-      Runner = ModelUnderTrainingRunner::createAndEnsureValid(
-          Ctx, ModelUnderTraining, DecisionName, TrainingInputFeatures);
+    if (MLGOUnrollMode == MLGOUnrollAdvisorMode::Training) {
+      if (!ModelUnderTraining.size()) {
+        dbgs() << "Using no inference model runner\n";
+        Runner = std::make_unique<NoInferenceModelRunner>(
+            Ctx, MLGOUnrollInputFeatures);
+      } else {
+        dbgs() << "Using model under training runner\n";
+        Runner = ModelUnderTrainingRunner::createAndEnsureValid(
+            Ctx, ModelUnderTraining, DecisionName, TrainingInputFeatures);
+      }
+    }
     else if (MLGOUnrollMode == MLGOUnrollAdvisorMode::Release)
       Ctx.emitError("Un-implemented runner type 'Release'");
     else
@@ -391,7 +393,7 @@ public:
   // Save **ALL** the logs
   bool flush();
 
-  // Runner for MLModel (logging / training / release)
+  // Runner for MLModel (training(default) / training(model) / release)
   std::unique_ptr<MLModelRunner> Runner;
 
 private:
