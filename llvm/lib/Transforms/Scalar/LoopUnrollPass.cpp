@@ -38,8 +38,8 @@
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/Analysis/TensorSpec.h"
-#include "llvm/Analysis/Utils/TrainingLogger.h"
 #include "llvm/Analysis/Utils/TFUtils.h"
+#include "llvm/Analysis/Utils/TrainingLogger.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constant.h"
@@ -59,6 +59,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Scalar/LoopPassManager.h"
@@ -68,6 +69,7 @@
 #include "llvm/Transforms/Utils/LoopUtils.h"
 #include "llvm/Transforms/Utils/SizeOpts.h"
 #include "llvm/Transforms/Utils/UnrollLoop.h"
+
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
@@ -465,8 +467,8 @@ void MLGOLoopUnrollAnalysis::extractFeatures(const unsigned LoopSize,
   }
 
   // Log extra outputs
-  if (MLGOUnrollMode == MLGOUnrollAdvisorMode::Training) {
-    auto *MUTR = dyn_cast<ModelUnderTrainingRunner>(Runner.get());
+  if (MLGOUnrollMode == MLGOUnrollAdvisorMode::Training && isa<ModelUnderTrainingRunner>(Runner.get())) {
+    auto *MUTR = cast<ModelUnderTrainingRunner>(Runner.get());
     for (size_t I = 1; I < MUTR->outputLoggedFeatureSpecs().size();
          ++I, ++CurrentFeature)
       Log->logSpecifiedTensorValue(
@@ -481,8 +483,10 @@ void MLGOLoopUnrollAnalysis::extractFeatures(const unsigned LoopSize,
 }
 
 bool MLGOLoopUnrollAnalysis::flush() {
+  // We should append to the log file.
+  // Make sure to always cleanup log file before re-accumluating one.
   std::error_code EC;
-  auto OS = std::make_unique<raw_fd_stream>(TrainingLog, EC);
+  auto OS = std::make_unique<raw_fd_ostream>(TrainingLog, EC, llvm::sys::fs::OF_Append);
   if (EC) {
     Ctx.emitError(EC.message() + ":" + TrainingLog);
     return false;
@@ -1070,8 +1074,7 @@ shouldPartialUnroll(const unsigned LoopSize, const unsigned TripCount,
     return 0;
   }
   unsigned PartialUnrollCount;
-  if (MLGOUnrollMode == MLGOUnrollAdvisorMode::Training) {
-    assert(MLGOAnalysis && isa<ModelUnderTrainingRunner>(MLGOAnalysis->Runner));
+  if (MLGOUnrollMode == MLGOUnrollAdvisorMode::Training && isa<ModelUnderTrainingRunner>(MLGOAnalysis->Runner)) {
     PartialUnrollCount = MLGOAnalysis->Runner->evaluate<int64_t>();
   } else {
     unsigned count = UP.Count;
