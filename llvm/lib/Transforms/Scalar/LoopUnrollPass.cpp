@@ -336,25 +336,20 @@ enum FeatureIDs {
       FeatureCount
 };
 
-#define _DECL_FEATURES(type, name, shape, _)                                   \
+#define DECL_FEATURES(type, name, shape, _)                                    \
   TensorSpec::createSpec<type>(#name, shape),
 
 // We can have separate kinds InputFeatures for training / production mode. For
 // now lets have one only for training.
-static const std::vector<TensorSpec> MLGOUnrollInputFeatures{
-    {LOOP_UNROLL_FEATURES_LIST(_DECL_FEATURES)},
-};
-#undef _DECL_FEATURES
-
-#define DECL_TRAIN_FEATURES(type, name, shape, _)                              \
-  TensorSpec::createSpec<type>(std::string("action_") + #name, shape),
+static const std::vector<TensorSpec> InputFeatures{
+    LOOP_UNROLL_FEATURES_LIST(DECL_FEATURES)};
 
 static const std::vector<TensorSpec> TrainingInputFeatures{
-    {LOOP_UNROLL_FEATURES_LIST(DECL_TRAIN_FEATURES)
-     TensorSpec::createSpec<float>("action_discount", {1}),
-     TensorSpec::createSpec<int32_t>("action_step_type", {1}),
-     TensorSpec::createSpec<float>("action_reward", {1})}};
-#undef DECL_TRAIN_FEATURES
+    LOOP_UNROLL_FEATURES_LIST(DECL_FEATURES)
+        TensorSpec::createSpec<float>("action_discount", {1}),
+    TensorSpec::createSpec<int32_t>("action_step_type", {1}),
+    TensorSpec::createSpec<float>("action_reward", {1})};
+#undef DECL_FEATURES
 
 static const TensorSpec MLGOUnrollOutputFeature =
     TensorSpec::createSpec<int32_t>("unroll_count", {1});
@@ -373,8 +368,7 @@ public:
     if (MLGOUnrollMode == MLGOUnrollAdvisorMode::Training) {
       if (!ModelUnderTraining.size()) {
         dbgs() << "Using no inference model runner\n";
-        Runner = std::make_unique<NoInferenceModelRunner>(
-            Ctx, MLGOUnrollInputFeatures);
+        Runner = std::make_unique<NoInferenceModelRunner>(Ctx, InputFeatures);
       } else {
         dbgs() << "Using model under training runner\n";
         Runner = ModelUnderTrainingRunner::createAndEnsureValid(
@@ -426,9 +420,7 @@ void MLGOLoopUnrollAnalysis::extractFeatures(const unsigned LoopSize,
   LoopPropertiesInfo LPI = LoopPropertiesInfo::getLoopPropertiesInfo(L, LI, SE);
 
 #define SET(id, type, val)                                                     \
-  do {                                                                         \
-    *Runner->getTensor<type>(FeatureIDs::id) = static_cast<type>(val);         \
-  } while (false);
+  *Runner->getTensor<type>(FeatureIDs::id) = static_cast<type>(val);
   SET(loop_size, int64_t, LoopSize);
   SET(trip_count, int64_t, TripCount);
   SET(is_innermost_loop, int64_t, LPI.IsInnerMostLoop);
@@ -441,14 +433,15 @@ void MLGOLoopUnrollAnalysis::extractFeatures(const unsigned LoopSize,
   SET(cast_inst_count, int64_t, LPI.CastInstCount);
 #undef SET
 
-  // Key = $(FUNCTION_NAME)__$(LOOP_NAME)
-  std::string Key =
-      L->getHeader()->getParent()->getName().str() + "__" + L->getName().str();
+  // Key = $(MODULE)###$(FUNCTION)###$(LOOP)
+  std::string Key = L->getHeader()->getModule()->getName().str() + "###" +
+                    L->getHeader()->getParent()->getName().str() + "###" +
+                    L->getName().str();
   LLVM_DEBUG(dbgs() << "Logging for " << Key << "\n");
   assert(!LogMap.count(Key) &&
          "Should only extract feature for every Loop ONCE");
   std::vector<LoggedFeatureSpec> LFS;
-  for (const auto &IF : MLGOUnrollInputFeatures) {
+  for (const auto &IF : InputFeatures) {
     LFS.push_back({IF, None});
   }
   LFS.push_back({MLGOUnrollOutputFeature, None});
@@ -480,6 +473,11 @@ void MLGOLoopUnrollAnalysis::extractFeatures(const unsigned LoopSize,
   // The output is right after the features and the extra outputs
   Log->logInt32Value(CurrentFeature,
                      reinterpret_cast<const int32_t *>(&UnrollCount));
+
+  dbgs() << Key << "\n"
+         << "   LoopSize: " << LoopSize << "\n"
+         << "   TripCount: " << TripCount << "\n"
+         << "   UnrollCount: " << UnrollCount << "\n";
 }
 
 bool MLGOLoopUnrollAnalysis::flush() {
@@ -1075,7 +1073,9 @@ shouldPartialUnroll(const unsigned LoopSize, const unsigned TripCount,
   }
   unsigned PartialUnrollCount;
   if (MLGOUnrollMode == MLGOUnrollAdvisorMode::Training && isa<ModelUnderTrainingRunner>(MLGOAnalysis->Runner)) {
+    dbgs() << "Calling evaluate of ModelUnderTrainingRunner\n";
     PartialUnrollCount = MLGOAnalysis->Runner->evaluate<int64_t>();
+    dbgs() << "PartialUnrollCount by model: " << PartialUnrollCount << "\n";
   } else {
     unsigned count = UP.Count;
     if (count == 0)
