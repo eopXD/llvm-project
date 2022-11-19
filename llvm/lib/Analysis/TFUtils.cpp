@@ -195,9 +195,11 @@ TFModelEvaluatorImpl::TFModelEvaluatorImpl(
     if (!InputFeed[I].oper) {
       continue;
     }
+    // TODO: We should be able to pass extra features into the model even if the model does
+    // not support it. The Runner should drop un-supported feature of the model.
     if (NrSupported++ != I) {
       errs()
-          << "Unsupported features must be placed at the end of the InputSpecs";
+          << "Unsupported features must be placed at the end of the InputSpecs\n";
       invalidate();
       return;
     }
