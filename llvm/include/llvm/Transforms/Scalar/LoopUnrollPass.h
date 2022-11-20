@@ -142,6 +142,8 @@ public:
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
   void printPipeline(raw_ostream &OS,
                      function_ref<StringRef(StringRef)> MapClassName2PassName);
+
+  ~LoopUnrollPass();
 };
 
 } // end namespace llvm
