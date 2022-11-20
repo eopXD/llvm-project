@@ -28,11 +28,18 @@
 #include "llvm/Analysis/LoopAnalysisManager.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/LoopPass.h"
+#include "llvm/Analysis/LoopPropertiesAnalysis.h"
 #include "llvm/Analysis/LoopUnrollAnalyzer.h"
+#include "llvm/Analysis/MLModelRunner.h"
+#include "llvm/Analysis/ModelUnderTrainingRunner.h"
+#include "llvm/Analysis/NoInferenceModelRunner.h"
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
 #include "llvm/Analysis/ProfileSummaryInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/Analysis/TensorSpec.h"
+#include "llvm/Analysis/Utils/TFUtils.h"
+#include "llvm/Analysis/Utils/TrainingLogger.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constant.h"
@@ -43,6 +50,7 @@
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/InitializePasses.h"
@@ -51,6 +59,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Scalar/LoopPassManager.h"
@@ -60,11 +69,13 @@
 #include "llvm/Transforms/Utils/LoopUtils.h"
 #include "llvm/Transforms/Utils/SizeOpts.h"
 #include "llvm/Transforms/Utils/UnrollLoop.h"
+
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <system_error>
 #include <tuple>
 #include <utility>
 
@@ -270,6 +281,232 @@ TargetTransformInfo::UnrollingPreferences llvm::gatherUnrollingPreferences(
 
   return UP;
 }
+
+/***** Start of MLGO *****/
+static cl::opt<bool>
+    EnableMLGOUnroll("mlgo-unroll", cl::init(false), cl::Hidden,
+                     cl::desc("Allows MLGO to operate on LoopUnroll"));
+
+static cl::opt<std::string>
+    ModelUnderTraining("mlgo-unroll-train-model", cl::Hidden,
+                       cl::desc("The model being trained for loop unroll"));
+
+static cl::opt<std::string> TrainingLog(
+    "mlgo-unroll-training-log", cl::Hidden,
+    cl::desc("Training log for the register allocator eviction model"));
+
+enum class MLGOUnrollAdvisorMode : int {
+  NotSet = -1,
+  Release = 0,  // TODO
+  Training = 1, // ModelUnderTrainingRunner, NoInferenceRunner
+};
+
+static cl::opt<MLGOUnrollAdvisorMode> MLGOUnrollMode(
+    "mlgo-unroll-mode", cl::Hidden, cl::init(MLGOUnrollAdvisorMode::NotSet),
+    cl::desc("Requires to set to one of 'release' or 'training'"),
+    cl::values(clEnumValN(MLGOUnrollAdvisorMode::Release, "release",
+                          "precompiled model"),
+               clEnumValN(MLGOUnrollAdvisorMode::Training, "training",
+                          "train rl model")));
+
+namespace mlgo_loop_unroll {
+
+// Tuple of (data_type, variable_name, shape, description)
+#define LOOP_UNROLL_FEATURES_LIST(M)                                           \
+  M(int64_t, loop_size, {1}, "size of loop")                                   \
+  M(int64_t, trip_count, {1}, "static trip count of loop")                     \
+  M(int64_t, is_innermost_loop, {1}, "whether the loop is the innermost loop") \
+  M(int64_t, preheader_blocksize, {1}, "preheader blocksize (by instruction)") \
+  M(int64_t, bb_count, {1}, "number of basic blocks (ignoring subloops)")      \
+  M(int64_t, num_of_loop_latch, {1}, "number of loop latches")                 \
+  M(int64_t, load_inst_count, {1}, "load instruction count")                   \
+  M(int64_t, store_inst_count, {1}, "store instruction count")                 \
+  M(int64_t, logical_inst_count, {1}, "logical instruction count")             \
+  M(int64_t, cast_inst_count, {1}, "cast instruction count")
+
+// The model learns to decide whether or not to unroll a loop.
+// If unroll_count == 0, a loop is not unrolled, otherwise it is unrolled by the
+// factor of provided decision.
+#define DecisionName "unroll_count"
+
+enum FeatureIDs {
+#define _FEATURE_IDX(_, name, __, ___) name,
+  LOOP_UNROLL_FEATURES_LIST(_FEATURE_IDX)
+#undef _FEATURE_IDX
+      FeatureCount
+};
+
+#define DECL_FEATURES(type, name, shape, _)                                    \
+  TensorSpec::createSpec<type>(#name, shape),
+
+// We can have separate kinds InputFeatures for training / production mode. For
+// now lets have one only for training.
+static const std::vector<TensorSpec> InputFeatures{
+    LOOP_UNROLL_FEATURES_LIST(DECL_FEATURES)};
+
+static const std::vector<TensorSpec> TrainingInputFeatures{
+    LOOP_UNROLL_FEATURES_LIST(DECL_FEATURES)
+    TensorSpec::createSpec<float>("action_discount", {1}),
+    TensorSpec::createSpec<int32_t>("action_step_type", {1}),
+    TensorSpec::createSpec<float>("action_reward", {1})};
+#undef DECL_FEATURES
+
+static const TensorSpec MLGOUnrollOutputFeature =
+    TensorSpec::createSpec<int32_t>("unroll_count", {1});
+
+/// Dummy reward
+static const TensorSpec MLGOUnrollRewardFeature =
+    TensorSpec::createSpec<float>("reward", {1});
+
+/// Class for MLGO in loop unroll. Since LoopUnroll is a LoopPass, the compiler
+/// will hold a local copy of this class, which will log (and inference for
+/// ModelUnderTrainingRunner) every time it is triggered. The analysis will dump
+/// all logs at the end of compilation, which will be at the dtor of LoopUnroll.
+class MLGOLoopUnrollAnalysis {
+  LLVMContext &Ctx;
+  // Loop::getName() -> Logger
+  StringMap<std::unique_ptr<Logger>> LogMap;
+
+public:
+  /// Constructor for MLGO in loop unroll.
+  MLGOLoopUnrollAnalysis(LLVMContext &Ctx) : Ctx(Ctx) {
+    if (MLGOUnrollMode == MLGOUnrollAdvisorMode::Training) {
+      if (!ModelUnderTraining.size()) {
+        dbgs() << "Using no inference model runner\n";
+        Runner = std::make_unique<NoInferenceModelRunner>(Ctx, InputFeatures);
+      } else {
+        dbgs() << "Using model under training runner\n";
+        Runner = ModelUnderTrainingRunner::createAndEnsureValid(
+            Ctx, ModelUnderTraining, DecisionName, TrainingInputFeatures);
+      }
+    }
+    else if (MLGOUnrollMode == MLGOUnrollAdvisorMode::Release)
+      Ctx.emitError("Un-implemented runner type 'Release'");
+    else
+      Ctx.emitError("Need to specify mode if mlgo-unroll is enabled");
+  }
+
+  MLGOLoopUnrollAnalysis() = delete;
+
+  /// Fill in input features into Runner.
+  void setFeatures(const unsigned LoopSize, const unsigned TripCount,
+                   LoopInfo *LI, ScalarEvolution *SE, Loop *L);
+
+  /// Log input features, extra output for ModelUnderTrainingRunner and
+  /// PartialUnrollCount(result of the model) using Logger.
+  void logFeaturesAndResult(const unsigned PartialUnrollCount, Loop *L);
+
+  /// Save **ALL** the logs
+  bool flush();
+
+  /// Runner for MLModel (training(default) / training(model) / release)
+  std::unique_ptr<MLModelRunner> Runner;
+
+private:
+  template <typename T> size_t getTotalSize(const std::vector<int64_t> &Shape) {
+    size_t Ret = sizeof(T);
+    for (const auto V : Shape)
+      Ret *= V;
+    return Ret;
+  }
+
+  void resetInputs() {
+#define _RESET(type, name, shape, _)                                           \
+  std::memset(Runner->getTensorUntyped(FeatureIDs::name), 0,                   \
+              getTotalSize<type>(shape));
+    LOOP_UNROLL_FEATURES_LIST(_RESET)
+#undef _RESET
+  }
+};
+
+void MLGOLoopUnrollAnalysis::setFeatures(const unsigned LoopSize,
+                                         const unsigned TripCount, LoopInfo *LI,
+                                         ScalarEvolution *SE, Loop *L) {
+  assert(LI != nullptr && SE != nullptr && L != nullptr);
+  resetInputs();
+
+  LoopPropertiesInfo LPI = LoopPropertiesInfo::getLoopPropertiesInfo(L, LI, SE);
+
+#define SET(id, type, val)                                                     \
+  *Runner->getTensor<type>(FeatureIDs::id) = static_cast<type>(val);
+  SET(loop_size, int64_t, LoopSize);
+  SET(trip_count, int64_t, TripCount);
+  SET(is_innermost_loop, int64_t, LPI.IsInnerMostLoop);
+  SET(preheader_blocksize, int64_t, LPI.PreheaderBlocksize);
+  SET(bb_count, int64_t, LPI.BasicBlockCount);
+  SET(num_of_loop_latch, int64_t, LPI.LoopLatchCount);
+  SET(load_inst_count, int64_t, LPI.LoadInstCount);
+  SET(store_inst_count, int64_t, LPI.StoreInstCount);
+  SET(logical_inst_count, int64_t, LPI.LogicalInstCount);
+  SET(cast_inst_count, int64_t, LPI.CastInstCount);
+#undef SET
+}
+
+void MLGOLoopUnrollAnalysis::logFeaturesAndResult(const unsigned UnrollCount,
+                                                  Loop *L) {
+  // Key = $(MODULE)###$(FUNCTION)###$(LOOP)
+  std::string Key = L->getHeader()->getModule()->getName().str() + "###" +
+                    L->getHeader()->getParent()->getName().str() + "###" +
+                    L->getName().str();
+  LLVM_DEBUG(dbgs() << "Logging for " << Key << "\n");
+  assert(!LogMap.count(Key) &&
+         "Should only extract feature for every Loop ONCE");
+  std::vector<LoggedFeatureSpec> LFS;
+  for (const auto &IF : InputFeatures) {
+    LFS.push_back({IF, None});
+  }
+  LFS.push_back({MLGOUnrollOutputFeature, None});
+
+  auto I = LogMap.insert((std::make_pair(
+      Key, std::make_unique<Logger>(LFS, MLGOUnrollRewardFeature,
+                                    /* IncludeReward */ false))));
+  assert(I.second && "Should be unique insertion");
+
+  Logger *Log = I.first->second.get();
+  size_t CurrentFeature = 0;
+  for (; CurrentFeature < FeatureIDs::FeatureCount; ++CurrentFeature) {
+    Log->logSpecifiedTensorValue(CurrentFeature,
+                                 reinterpret_cast<const char *>(
+                                     Runner->getTensorUntyped(CurrentFeature)));
+  }
+
+  // Log extra outputs
+  // if (MLGOUnrollMode == MLGOUnrollAdvisorMode::Training && isa<ModelUnderTrainingRunner>(Runner.get())) {
+  //   auto *MUTR = cast<ModelUnderTrainingRunner>(Runner.get());
+  //   for (size_t I = 1; I < MUTR->outputLoggedFeatureSpecs().size();
+  //        ++I, ++CurrentFeature) {
+  //     dbgs() << "Logging extra output for model under training (" << I << ")\n";
+  //     Log->logSpecifiedTensorValue(
+  //         CurrentFeature,
+  //         reinterpret_cast<const char *>(
+  //             MUTR->lastEvaluationResult()->getUntypedTensorValue(I)));
+  //   }
+  // }
+
+  // The output is right after the features and the extra outputs
+  Log->logInt32Value(CurrentFeature,
+                     reinterpret_cast<const int32_t *>(&UnrollCount));
+
+  dbgs() << Key << "\n"
+         << "   UnrollCount: " << UnrollCount << "\n";
+}
+
+bool MLGOLoopUnrollAnalysis::flush() {
+  // We should append to the log file.
+  // Make sure to always cleanup log file before re-accumluating one.
+  std::error_code EC;
+  auto OS = std::make_unique<raw_fd_ostream>(TrainingLog, EC, llvm::sys::fs::OF_Append);
+  if (EC) {
+    Ctx.emitError(EC.message() + ":" + TrainingLog);
+    return false;
+  }
+  Logger::flushLogs(*OS, LogMap);
+  return true;
+}
+/***** End of MLGO *****/
+} // namespace mlgo_loop_unroll
+
+static mlgo_loop_unroll::MLGOLoopUnrollAnalysis *MLGOAnalysis = nullptr;
 
 namespace {
 
@@ -833,7 +1070,9 @@ static Optional<unsigned> shouldFullUnroll(
 static Optional<unsigned>
 shouldPartialUnroll(const unsigned LoopSize, const unsigned TripCount,
                     const UnrollCostEstimator UCE,
-                    const TargetTransformInfo::UnrollingPreferences &UP) {
+                    const TargetTransformInfo::UnrollingPreferences &UP,
+                    /* These 3 are For MLGO */ LoopInfo *LI = nullptr,
+                    ScalarEvolution *SE = nullptr, Loop *L = nullptr) {
 
   if (!TripCount)
     return None;
@@ -843,40 +1082,66 @@ shouldPartialUnroll(const unsigned LoopSize, const unsigned TripCount,
                << "-unroll-allow-partial not given\n");
     return 0;
   }
-  unsigned count = UP.Count;
-  if (count == 0)
-    count = TripCount;
-  if (UP.PartialThreshold != NoThreshold) {
-    // Reduce unroll count to be modulo of TripCount for partial unrolling.
-    if (UCE.getUnrolledLoopSize(UP, count) > UP.PartialThreshold)
-      count = (std::max(UP.PartialThreshold, UP.BEInsns + 1) - UP.BEInsns) /
-        (LoopSize - UP.BEInsns);
+
+  /***** Start of MLGO *****/
+  // We need to set the input features so the model can run evaluate.
+  if (MLGOAnalysis) {
+    assert(EnableMLGOUnroll);
+    MLGOAnalysis->setFeatures(LoopSize, TripCount, LI, SE, L);
+  }
+  /***** End of MLGO *****/
+
+  unsigned PartialUnrollCount;
+  if (MLGOUnrollMode == MLGOUnrollAdvisorMode::Training && isa<ModelUnderTrainingRunner>(MLGOAnalysis->Runner)) {
+    dbgs() << "Calling evaluate of ModelUnderTrainingRunner\n";
+    PartialUnrollCount = MLGOAnalysis->Runner->evaluate<int64_t>();
+    dbgs() << "PartialUnrollCount by model: " << PartialUnrollCount << "\n";
+  } else {
+    unsigned count = UP.Count;
+    if (count == 0)
+      count = TripCount;
+    if (UP.PartialThreshold != NoThreshold) {
+      // Reduce unroll count to be modulo of TripCount for partial unrolling.
+      if (UCE.getUnrolledLoopSize(UP, count) > UP.PartialThreshold)
+        count = (std::max(UP.PartialThreshold, UP.BEInsns + 1) - UP.BEInsns) /
+                (LoopSize - UP.BEInsns);
+      if (count > UP.MaxCount)
+        count = UP.MaxCount;
+      while (count != 0 && TripCount % count != 0)
+        count--;
+      if (UP.AllowRemainder && count <= 1) {
+        // If there is no Count that is modulo of TripCount, set Count to
+        // largest power-of-two factor that satisfies the threshold limit.
+        // As we'll create fixup loop, do the type of unrolling only if
+        // remainder loop is allowed.
+        count = UP.DefaultUnrollRuntimeCount;
+        while (count != 0 &&
+               UCE.getUnrolledLoopSize(UP, count) > UP.PartialThreshold)
+          count >>= 1;
+      }
+      if (count < 2) {
+        count = 0;
+      }
+    } else {
+      count = TripCount;
+    }
     if (count > UP.MaxCount)
       count = UP.MaxCount;
-    while (count != 0 && TripCount % count != 0)
-      count--;
-    if (UP.AllowRemainder && count <= 1) {
-      // If there is no Count that is modulo of TripCount, set Count to
-      // largest power-of-two factor that satisfies the threshold limit.
-      // As we'll create fixup loop, do the type of unrolling only if
-      // remainder loop is allowed.
-      count = UP.DefaultUnrollRuntimeCount;
-      while (count != 0 &&
-             UCE.getUnrolledLoopSize(UP, count) > UP.PartialThreshold)
-        count >>= 1;
-    }
-    if (count < 2) {
-      count = 0;
-    }
-  } else {
-    count = TripCount;
+
+    PartialUnrollCount = count;
   }
-  if (count > UP.MaxCount)
-    count = UP.MaxCount;
 
-  LLVM_DEBUG(dbgs() << "  partially unrolling with count: " << count << "\n");
+  LLVM_DEBUG(dbgs() << "  partially unrolling with count: "
+                    << PartialUnrollCount << "\n");
 
-  return count;
+  /***** Start of MLGO *****/
+  if (MLGOAnalysis) {
+    assert(EnableMLGOUnroll);
+    MLGOAnalysis->logFeaturesAndResult(PartialUnrollCount, L);
+  }
+  /***** End of MLGO *****/
+
+  return PartialUnrollCount;
 }
 // Returns true if unroll count was set explicitly.
 // Calculates unroll count and writes it to UP.Count.
@@ -992,7 +1257,8 @@ bool llvm::computeUnrollCount(
 
   // 6th priority is partial unrolling.
   // Try partial unroll only when TripCount could be statically calculated.
-  if (auto UnrollFactor = shouldPartialUnroll(LoopSize, TripCount, UCE, UP)) {
+  if (auto UnrollFactor =
+          shouldPartialUnroll(LoopSize, TripCount, UCE, UP, LI, &SE, L)) {
     UP.Count = *UnrollFactor;
 
     if ((PragmaFullUnroll || PragmaEnableUnroll) && TripCount &&
@@ -1576,6 +1842,13 @@ PreservedAnalyses LoopUnrollPass::run(Function &F,
   auto *BFI = (PSI && PSI->hasProfileSummary()) ?
       &AM.getResult<BlockFrequencyAnalysis>(F) : nullptr;
 
+  /***** Start of MLGO *****/
+  if (EnableMLGOUnroll && !MLGOAnalysis) {
+    MLGOAnalysis =
+        new mlgo_loop_unroll::MLGOLoopUnrollAnalysis(SE.getContext());
+  }
+  /***** End of MLGO *****/
+
   bool Changed = false;
 
   // The unroller requires loops to be in simplified form, and also needs LCSSA.
@@ -1660,3 +1933,13 @@ void LoopUnrollPass::printPipeline(
   OS << "O" << UnrollOpts.OptLevel;
   OS << ">";
 }
+
+/***** Start of MLGO *****/
+LoopUnrollPass::~LoopUnrollPass() {
+  // At end of compilation, the LoopUnrollPass dtor is triggered, which is when
+  // we will dump the logs.
+  if (EnableMLGOUnroll && MLGOAnalysis) {
+    MLGOAnalysis->flush();
+  }
+}
+/***** End of MLGO *****/

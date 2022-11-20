@@ -52,6 +52,7 @@
 #include "llvm/Analysis/LoopCacheAnalysis.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/LoopNestAnalysis.h"
+#include "llvm/Analysis/LoopPropertiesAnalysis.h"
 #include "llvm/Analysis/MemDerefPrinter.h"
 #include "llvm/Analysis/MemoryDependenceAnalysis.h"
 #include "llvm/Analysis/MemorySSA.h"
